@@ -1,0 +1,792 @@
+import os
+import re
+import json
+import base64
+import threading
+import copy
+from datetime import datetime
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BotCommand
+
+try:
+    from PIL import Image, ImageEnhance, ImageOps
+    from pyzbar.pyzbar import decode as decode_barcode
+    BARCODE_ENABLED = True
+except ImportError:
+    BARCODE_ENABLED = False
+
+try:
+    import cv2
+    CV2_ENABLED = True
+except ImportError:
+    CV2_ENABLED = False
+
+try:
+    import pytesseract
+    OCR_ENABLED = True
+except ImportError:
+    OCR_ENABLED = False
+
+# Resolve all project paths relative to this file (not the current working directory).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+FRONTEND_DIST = os.path.join(FRONTEND_DIR, "dist")
+
+# Load the optional .env file without requiring it for Flask-only mode.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(BASE_DIR, ".env"))
+except ImportError:
+    pass
+
+from cct_storage import init_db, read_state, write_state
+
+# Never keep a real Telegram bot token in source code.
+BOT_TOKEN = os.environ.get("CCT_BOT_TOKEN", "").strip() or "000000:PLACEHOLDER"
+db_lock = threading.Lock()
+
+driver_bot_sessions = {}
+
+def get_today_iso():
+    return datetime.now().strftime("%Y-%m-%d")
+
+DEFAULT_DB = {
+    "users": [],
+    "telegramDriverMap": {},
+    "shops": [],
+    "knownGroups": {},
+    "recentPhotos": [],
+    "logs": []
+}
+
+def load_db():
+    with db_lock:
+        data = read_state()
+        if not isinstance(data, dict):
+            data = copy.deepcopy(DEFAULT_DB)
+            write_state(data)
+        data.setdefault("users", DEFAULT_DB["users"])
+        data.setdefault("telegramDriverMap", {})
+        data.setdefault("knownGroups", {})
+        data.setdefault("recentPhotos", [])
+        data.setdefault("shops", DEFAULT_DB["shops"])
+        data.setdefault("logs", [])
+        return data
+
+def save_db(data):
+    with db_lock:
+        write_state(data)
+
+def get_driver_name_from_telegram_user(tg_user, data=None):
+    if data is None:
+        data = load_db()
+    uid_str = str(tg_user.id)
+    mapped_name = data.get("telegramDriverMap", {}).get(uid_str)
+    if mapped_name:
+        return mapped_name
+    full_name = " ".join(filter(None, [tg_user.first_name, tg_user.last_name])).strip()
+    return full_name or tg_user.username or "Driver"
+
+def normalize_name(text):
+    return re.sub(r"[^a-z0-9\u1780-\u17ff]", "", str(text or "").lower())
+
+def build_bot_scan_reply_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    kb.row(
+        KeyboardButton("🚚 ១. Scan ចាប់ផ្តើមដឹក (On Delivery)"),
+        KeyboardButton("📸 ២. ដល់ទីតាំង Scan+ថតរូបទម្លាក់ទំនិញ")
+    )
+    kb.row(KeyboardButton("📋 បញ្ជីកញ្ចប់កំពុងដឹករបស់ខ្ញុំ"))
+    return kb
+
+def auto_register_group_chat(chat):
+    if not chat or chat.type not in ["group", "supergroup"]:
+        return None
+    group_title = chat.title or "Telegram Group"
+    norm_title = normalize_name(group_title)
+    chat_id_str = str(chat.id)
+
+    data = load_db()
+    changed = False
+    known_groups = data.setdefault("knownGroups", {})
+    if known_groups.get(chat_id_str) != group_title:
+        known_groups[chat_id_str] = group_title
+        changed = True
+
+    for shop in data.get("shops", []):
+        norm_shop = normalize_name(shop.get("name", ""))
+        if norm_shop and (norm_shop in norm_title or (norm_title and norm_title in norm_shop)):
+            if shop.get("telegramChatId") != chat_id_str:
+                shop["telegramChatId"] = chat_id_str
+                changed = True
+    if changed:
+        save_db(data)
+
+def find_package_by_text(query_str):
+    q = str(query_str or "").strip().lower()
+    if not q:
+        return None, load_db()
+    data = load_db()
+    clean_q = q.replace(" ", "").replace("-", "")
+    for item in reversed(data.get("logs", [])):
+        inv = str(item.get("invNo", "")).lower()
+        phone = str(item.get("phone", "")).lower().replace(" ", "")
+        if inv == q or inv.replace("-", "") == clean_q or phone == clean_q:
+            return item, data
+        if q.isdigit() and inv == f"inv-{int(q):04d}":
+            return item, data
+    return None, data
+
+def find_package_in_free_text(raw_text):
+    if not raw_text:
+        return None, load_db()
+    data = load_db()
+    inv_match = re.search(r"inv[-_\s]*(\d+)", raw_text, re.IGNORECASE)
+    if inv_match:
+        target_inv = f"inv-{int(inv_match.group(1)):04d}"
+        for item in reversed(data.get("logs", [])):
+            if str(item.get("invNo", "")).lower() == target_inv:
+                return item, data
+    phone_matches = re.findall(r"0\d{2}[\s-]?\d{3}[\s-]?\d{3,4}", raw_text)
+    for ph in phone_matches:
+        clean_ph = ph.replace(" ", "").replace("-", "")
+        for item in reversed(data.get("logs", [])):
+            if str(item.get("phone", "")).replace(" ", "").replace("-", "") == clean_ph:
+                return item, data
+    return None, data
+
+def extract_package_from_image(image_path):
+    codes_found = []
+    if BARCODE_ENABLED:
+        try:
+            img = Image.open(image_path)
+            for v_img in [img, ImageOps.grayscale(img), ImageEnhance.Contrast(ImageOps.grayscale(img)).enhance(2.2)]:
+                decoded = decode_barcode(v_img)
+                if decoded:
+                    for obj in decoded:
+                        val = obj.data.decode("utf-8").strip()
+                        if val and val not in codes_found:
+                            codes_found.append(val)
+                    if codes_found:
+                        break
+        except Exception:
+            pass
+    if not codes_found and CV2_ENABLED:
+        try:
+            cv_img = cv2.imread(image_path)
+            if cv_img is not None and hasattr(cv2, "barcode_BarcodeDetector"):
+                detector = cv2.barcode_BarcodeDetector()
+                ok, decoded_info, _, _ = detector.detectAndDecodeMulti(cv_img)
+                if ok and decoded_info:
+                    for val in decoded_info:
+                        if val and val.strip():
+                            codes_found.append(val.strip())
+        except Exception:
+            pass
+    for code in codes_found:
+        item, data = find_package_by_text(code)
+        if item:
+            return item, data, code
+    if OCR_ENABLED:
+        try:
+            ocr_text = pytesseract.image_to_string(Image.open(image_path))
+            item, data = find_package_in_free_text(ocr_text)
+            if item:
+                return item, data, item.get("invNo")
+        except Exception:
+            pass
+    return None, load_db(), (codes_found[0] if codes_found else None)
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+def find_shop_chat_id(shop_name, data):
+    shops_list = data.get("shops", [])
+    norm_target = normalize_name(shop_name)
+    shop_obj = next((s for s in shops_list if normalize_name(s.get("name")) == norm_target), None)
+    if shop_obj and shop_obj.get("telegramChatId"):
+        return str(shop_obj.get("telegramChatId")).strip()
+    known_groups = data.get("knownGroups", {})
+    for cid, gtitle in known_groups.items():
+        norm_g = normalize_name(gtitle)
+        if norm_target and (norm_target in norm_g or norm_g in norm_target):
+            if shop_obj:
+                shop_obj["telegramChatId"] = str(cid)
+                save_db(data)
+            return str(cid)
+    if len(known_groups) == 1:
+        return str(next(iter(known_groups.keys())))
+    return ""
+
+def find_photo_message_id_to_reply(chat_id, item, data):
+    chat_id_str = str(chat_id)
+    if item and item.get("telegramPhotoMsgId") and str(item.get("telegramChatId", "")) == chat_id_str:
+        return int(item["telegramPhotoMsgId"])
+    group_photos = [p for p in data.get("recentPhotos", []) if str(p.get("chatId")) == chat_id_str]
+    if not group_photos:
+        return None
+    if item:
+        inv_no = str(item.get("invNo", "")).lower()
+        for p in reversed(group_photos):
+            if inv_no and str(p.get("invNo", "")).lower() == inv_no:
+                return int(p["messageId"])
+    return int(group_photos[-1]["messageId"])
+
+def build_status_alert_message(item, driver_name=""):
+    drv = (driver_name or item.get("driverName") or "មិនទាន់កំណត់").strip()
+    deliv_st = item.get("deliveryStatus", "កំពុងដឹក")
+    is_prob = item.get("isProblem") or deliv_st == "កញ្ចប់បញ្ហា"
+    is_done = deliv_st == "ទម្លាក់រួច" and not is_prob
+    rem_text = item.get("remark") or item.get("reason") or ("ទម្លាក់រួចរាល់" if is_done else ("កំពុងដឹកជញ្ជូន" if not is_prob else "មានបញ្ហា"))
+    now_str = datetime.now().strftime("%Y-%m-%d (%I:%M %p)")
+    cust_name = item.get("name") or "អតិថិជន"
+
+    if is_done:
+        header_banner = f"✅ <b>ជូនដំណឹង៖ អតិថិជនឈ្មោះ «{cust_name}» បានទម្លាក់ទំនិញរួចរាល់ហើយ!</b>"
+        status_badge = "🟢 ទម្លាក់រួចរាល់ (Delivered)"
+    elif is_prob:
+        header_banner = f"🚨 <b>ALERT កញ្ចប់មានបញ្ហា!</b>\n⚠️ <b>អតិថិជនឈ្មោះ «{cust_name}» មានបញ្ហា៖ {rem_text}</b>"
+        status_badge = f"🔴 មានបញ្ហា ({rem_text})"
+    else:
+        header_banner = f"🚚 <b>កំពុងដឹកជញ្ជូនជូនអតិថិជនឈ្មោះ «{cust_name}»</b>"
+        status_badge = "🟡 កំពុងដឹក (On Delivery)"
+
+    return (
+        f"{header_banner}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>ឈ្មោះអតិថិជន៖</b> <b>{cust_name}</b>\n"
+        f"📞 <b>លេខទូរស័ព្ទ៖</b> <code>{item.get('phone', '')}</code>\n"
+        f"📍 <b>ទីតាំង៖</b> {item.get('address', '')}\n"
+        f"💵 <b>ទឹកប្រាក់៖</b> <b>${float(item.get('total', 0)):.2f}</b> ({item.get('status', 'COD')})\n"
+        f"🏪 <b>ហាង៖</b> {item.get('shop', '')} | 🏷️ <code>{item.get('invNo', '')}</code>\n"
+        f"🛵 <b>អ្នកដឹកជញ្ជូន (Driver)៖</b> <b>{drv}</b> ({item.get('shift', 'ពេលព្រឹក')})\n"
+        f"📊 <b>ស្ថានភាព៖</b> {status_badge}\n"
+        f"📝 <b>ចំណាំ (Remark)៖</b> <b>{rem_text}</b>\n"
+        f"🕒 <b>ម៉ោងបញ្ជាក់៖</b> {now_str}"
+    )
+
+def send_alert_to_shop_group(item, data, driver_name="", proof_photo_source=None):
+    shop_name = item.get("shop", "")
+    shop_chat_id = item.get("telegramChatId") or find_shop_chat_id(shop_name, data)
+    if not shop_chat_id:
+        return False, f"មិនទាន់ឃើញ Group សម្រាប់ហាង «{shop_name}»"
+
+    drv = driver_name or item.get("driverName") or "Driver"
+    item["driverName"] = drv
+    alert_text = build_status_alert_message(item, drv)
+    reply_msg_id = find_photo_message_id_to_reply(shop_chat_id, item, data)
+
+    try:
+        photo_to_send = proof_photo_source or item.get("deliveryProofFileId")
+        if photo_to_send and item.get("deliveryStatus") in ["ទម្លាក់រួច", "កញ្ចប់បញ្ហា"]:
+            if isinstance(photo_to_send, str) and photo_to_send.startswith("data:image"):
+                raw_b64 = photo_to_send.split(",", 1)[1]
+                img_bytes = base64.b64decode(raw_b64)
+                bot.send_photo(
+                    shop_chat_id,
+                    img_bytes,
+                    caption=alert_text,
+                    reply_to_message_id=reply_msg_id,
+                    allow_sending_without_reply=True
+                )
+            else:
+                bot.send_photo(
+                    shop_chat_id,
+                    photo_to_send,
+                    caption=alert_text,
+                    reply_to_message_id=reply_msg_id,
+                    allow_sending_without_reply=True
+                )
+            return True, f"បានផ្ញើរូបថតភស្តុតាង និង Reply ក្នុង Group ហាង «{shop_name}» (អ្នកដឹក៖ {drv}) ជោគជ័យ!"
+        else:
+            bot.send_message(
+                shop_chat_id,
+                alert_text,
+                reply_to_message_id=reply_msg_id,
+                allow_sending_without_reply=True
+            )
+            return True, f"បានផ្ញើសារជូនដំណឹង (អ្នកដឹក៖ {drv}) ចូលក្នុង Group ហាង «{shop_name}» ជោគជ័យ!"
+    except Exception as e:
+        return False, f"កំហុសពេលផ្ញើទៅ Group: {e}"
+
+def build_dropoff_status_keyboard(inv_no):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ ទម្លាក់រួច (សាច់ប្រាក់)", callback_data=f"DROP|{inv_no}|OK|ទម្លាក់រួច (ទទួលសាច់ប្រាក់)"),
+        InlineKeyboardButton("✅ ទម្លាក់រួច (ABA)", callback_data=f"DROP|{inv_no}|OK|ទម្លាក់រួច (ABA)")
+    )
+    markup.add(
+        InlineKeyboardButton("📞 ទាក់ទងមិនចូល", callback_data=f"DROP|{inv_no}|PROB|ទាក់ទងមិនចូល"),
+        InlineKeyboardButton("❌ ភ្ញៀវមិនយក", callback_data=f"DROP|{inv_no}|PROB|ភ្ញៀវបដិសេធមិនយក")
+    )
+    markup.add(
+        InlineKeyboardButton("📝 វាយ Remark ផ្ទាល់ខ្លួន (រួចរាល់)", callback_data=f"ASKREM|{inv_no}|OK"),
+        InlineKeyboardButton("⚠️ វាយមូលហេតុបញ្ហាផ្ទាល់ខ្លួន", callback_data=f"ASKREM|{inv_no}|PROB")
+    )
+    return markup
+
+@bot.message_handler(commands=["login"])
+def handle_bot_driver_login(message):
+    parts = message.text.split()
+    if len(parts) < 3:
+        bot.reply_to(
+            message,
+            "🔑 <b>របៀប Login គណនីអ្នកដឹកក្នុង Bot៖</b>\n"
+            "សូមវាយ៖ <code>/login ឈ្មោះគណនី លេខសម្ងាត់</code>\n"
+            "ឧទាហរណ៍៖ <code>/login fuji 123</code>"
+        )
+        return
+    uname, pwd = parts[1].strip().lower(), parts[2].strip()
+    data = load_db()
+    found = next((u for u in data.get("users", []) if str(u.get("username", "")).lower() == uname and str(u.get("password", "")) == pwd), None)
+    if not found:
+        bot.reply_to(message, "❌ ឈ្មោះគណនី ឬលេខសម្ងាត់មិនត្រឹមត្រូវទេ!")
+        return
+    dname = found.get("displayName") or found.get("username")
+    data.setdefault("telegramDriverMap", {})[str(message.from_user.id)] = dname
+    save_db(data)
+    bot.reply_to(
+        message,
+        f"✅ <b>បានភ្ជាប់គណនីអ្នកដឹកជញ្ជូនជោគជ័យ!</b>\n"
+        f"🛵 ឈ្មោះអ្នកដឹករបស់អ្នកគឺ៖ <b>{dname}</b> (រាល់ការ Scan & ថតរូបនឹងដាក់ឈ្មោះ <b>{dname}</b> ដោយស្វ័យប្រវត្តិ)!",
+        reply_markup=build_bot_scan_reply_keyboard()
+    )
+
+@bot.message_handler(commands=["start", "help", "scan"])
+def handle_start(message):
+    auto_register_group_chat(message.chat)
+    if message.chat.type in ["group", "supergroup"]:
+        bot.reply_to(
+            message,
+            f"✅ <b>Group «{message.chat.title}» បានភ្ជាប់រួចរាល់!</b>\n"
+            f"• ពេលទម្លាក់រូបបណ្ណចូល Group នេះ វារក្សាទុកក្នុងស្ថានភាព <b>កំពុងដឹក</b>។\n"
+            f"• ពេលអ្នកដឹកស្កេនចេញដឹក (On Delivery) និងពេលដល់ទីតាំងថតរូបទម្លាក់ទំនិញ វានឹងលោត Reply ភ្ជាប់រូបថត និងឈ្មោះអ្នកដឹកស្វ័យប្រវត្តិ។"
+        )
+    else:
+        data = load_db()
+        drv_name = get_driver_name_from_telegram_user(message.from_user, data)
+        bot.reply_to(
+            message,
+            f"🛵 <b>សូមស្វាគមន៍អ្នកដឹកជញ្ជូន៖ {drv_name}</b> (ចាប់ឈ្មោះស្វ័យប្រវត្តិ)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"១. <b>មុនចេញដឹក៖</b> ចុច <b>«🚚 ១. Scan ចាប់ផ្តើមដឹក (On Delivery)»</b> រួចថត Barcode ឬវាយលេខបណ្ណ។\n\n"
+            f"២. <b>ពេលដល់ទីតាំងភ្ញៀវ៖</b> ចុច <b>«📸 ២. ដល់ទីតាំង Scan+ថតរូបទម្លាក់ទំនិញ»</b> រួចថតរូបទំនិញ/បណ្ណភ្ជាប់ជាមួយ ដើម្បីជ្រើសរើសស្ថានភាព និង Remark។\n\n"
+            f"💡 <i>បើចង់ប្ដូរឈ្មោះតាមគណនីដែល Admin បង្កើតឱ្យ សូមវាយ៖ <code>/login username password</code></i>",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo_messages(message):
+    if message.content_type == "document":
+        mime = getattr(message.document, "mime_type", "") or ""
+        if not mime.startswith("image/"):
+            return
+        photo_file_id = message.document.file_id
+    else:
+        photo_file_id = message.photo[-1].file_id
+
+    caption_text = (message.caption or "").strip()
+    item = None
+    data = load_db()
+    driver_name = get_driver_name_from_telegram_user(message.from_user, data)
+
+    try:
+        file_info = bot.get_file(photo_file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        temp_img = f"scan_{message.chat.id}_{message.message_id}.jpg"
+        with open(temp_img, "wb") as f:
+            f.write(downloaded)
+        item, data, _ = extract_package_from_image(temp_img)
+        if os.path.exists(temp_img):
+            os.remove(temp_img)
+    except Exception:
+        pass
+
+    if not item and caption_text:
+        item, data = find_package_in_free_text(caption_text)
+
+    if message.chat.type in ["group", "supergroup"]:
+        auto_register_group_chat(message.chat)
+        if not item and data.get("logs"):
+            unlinked = [x for x in data["logs"] if not x.get("telegramPhotoMsgId")]
+            item = unlinked[-1] if unlinked else data["logs"][-1]
+
+        inv_key = item.get("invNo") if item else ""
+        recent_photos = data.setdefault("recentPhotos", [])
+        recent_photos.append({
+            "chatId": str(message.chat.id),
+            "groupTitle": message.chat.title or "Telegram Group",
+            "messageId": message.message_id,
+            "fileId": photo_file_id,
+            "invNo": inv_key,
+            "caption": caption_text,
+            "date": int(datetime.now().timestamp())
+        })
+        if item:
+            item["lastPhotoFileId"] = photo_file_id
+            item["telegramChatId"] = str(message.chat.id)
+            item["telegramPhotoMsgId"] = message.message_id
+            if not item.get("deliveryStatus"):
+                item["deliveryStatus"] = "កំពុងដឹក"
+        save_db(data)
+        return
+
+    user_id = message.from_user.id
+    sess = driver_bot_sessions.get(user_id, {"mode": "DROP"})
+
+    if not item and sess.get("invNo"):
+        item, data = find_package_by_text(sess["invNo"])
+
+    if not item:
+        driver_bot_sessions[user_id] = {"mode": sess.get("mode", "DROP"), "pendingPhotoId": photo_file_id}
+        bot.reply_to(
+            message,
+            "📸 <b>បានទទួលរូបថតហើយ!</b>\nប៉ុន្តែមើលមិនឃើញលេខ Barcode ច្បាស់ទេ សូមវាយបញ្ចូល <b>លេខបណ្ណ (ឧ. <code>INV-0005</code> ឬ <code>0005</code>)</b> ឥឡូវនេះ៖",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+        return
+
+    if sess.get("mode") == "PICKUP":
+        item["driverName"] = driver_name
+        item["deliveryStatus"] = "កំពុងដឹក"
+        item["isProblem"] = False
+        if not item.get("remark"):
+            item["remark"] = "កំពុងដឹកជញ្ជូន (On Delivery)"
+        save_db(data)
+        ok, note = send_alert_to_shop_group(item, data, driver_name)
+        bot.reply_to(
+            message,
+            f"🚚 <b>បានកត់ត្រាការចេញដឹក (On Delivery) រួចរាល់!</b>\n"
+            f"🔖 បណ្ណ៖ <code>{item.get('invNo')}</code> ({item.get('shop')})\n"
+            f"👤 អតិថិជន៖ <b>{item.get('name')}</b> ({item.get('phone')})\n"
+            f"🛵 អ្នកដឹកជញ្ជូន៖ <b>{driver_name}</b> (ស្វ័យប្រវត្តិ)\n\n"
+            f"🚀 {note}",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+        return
+
+    item["driverName"] = driver_name
+    item["deliveryProofFileId"] = photo_file_id
+    save_db(data)
+    driver_bot_sessions[user_id] = {"mode": "DROP", "invNo": item.get("invNo"), "photoId": photo_file_id}
+
+    bot.reply_to(
+        message,
+        f"📸 <b>បានភ្ជាប់រូបថតភស្តុតាងសម្រាប់បណ្ណ <code>{item.get('invNo')}</code> រួចរាល់!</b>\n"
+        f"👤 អតិថិជន៖ <b>{item.get('name')}</b> (<code>{item.get('phone')}</code>)\n"
+        f"🛵 អ្នកដឹកជញ្ជូន៖ <b>{driver_name}</b> (ស្វ័យប្រវត្តិ)\n\n"
+        f"👇 <b>សូមចុចជ្រើសរើសស្ថានភាពទម្លាក់ទំនិញ ឬដាក់ Remark ខាងក្រោម ដើម្បីឱ្យ Bot ផ្ញើរូបថតនេះភ្ជាប់ចូល Group ហាង៖</b>",
+        reply_markup=build_dropoff_status_keyboard(item.get("invNo"))
+    )
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_buttons(call):
+    auto_register_group_chat(call.message.chat)
+    parts = call.data.split("|")
+    action = parts[0]
+    data = load_db()
+    driver_name = get_driver_name_from_telegram_user(call.from_user, data)
+
+    if action == "DROP" and len(parts) >= 4:
+        inv_no, mode, remark_text = parts[1], parts[2], parts[3]
+        item, data = find_package_by_text(inv_no)
+        if not item:
+            bot.answer_callback_query(call.id, "រកមិនឃើញបណ្ណនេះទេ!", show_alert=True)
+            return
+
+        if not item.get("deliveryProofFileId"):
+            bot.answer_callback_query(call.id, "⚠️ សូមថតរូបទំនិញភ្ជាប់ជាមុនសិន មុននឹងបញ្ជាក់ការទម្លាក់ទំនិញ!", show_alert=True)
+            return
+
+        item["driverName"] = driver_name
+        item["deliveryStatus"] = "ទម្លាក់រួច" if mode == "OK" else "កញ្ចប់បញ្ហា"
+        item["isProblem"] = (mode != "OK")
+        item["remark"] = remark_text
+        item["reason"] = remark_text if item["isProblem"] else ""
+        save_db(data)
+
+        ok, note = send_alert_to_shop_group(item, data, driver_name, item.get("deliveryProofFileId"))
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=build_status_alert_message(item, driver_name) + f"\n\n📸 <b>{note}</b>"
+        )
+        bot.answer_callback_query(call.id, f"បានផ្ញើរូបថត និងបញ្ជាក់៖ {remark_text}")
+
+    elif action == "ASKREM" and len(parts) >= 3:
+        inv_no, mode = parts[1], parts[2]
+        driver_bot_sessions[call.from_user.id] = {
+            "mode": "WAIT_CUSTOM_REMARK",
+            "invNo": inv_no,
+            "statusMode": mode
+        }
+        lbl = "✅ ទម្លាក់រួចរាល់" if mode == "OK" else "⚠️ កញ្ចប់មានបញ្ហា"
+        bot.send_message(
+            call.message.chat.id,
+            f"✍️ សូមវាយបញ្ចូល <b>Remark / មូលហេតុ</b> សម្រាប់បណ្ណ <code>{inv_no}</code> ({lbl})៖"
+        )
+        bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def handle_all_text(message):
+    auto_register_group_chat(message.chat)
+    if message.chat.type in ["group", "supergroup"]:
+        return
+
+    user_id = message.from_user.id
+    text = message.text.strip()
+    data = load_db()
+    driver_name = get_driver_name_from_telegram_user(message.from_user, data)
+
+    if text == "🚚 ១. Scan ចាប់ផ្តើមដឹក (On Delivery)":
+        driver_bot_sessions[user_id] = {"mode": "PICKUP"}
+        bot.reply_to(
+            message,
+            f"🚚 <b>មុខងារ Scan ចាប់ផ្តើមដឹកចេញ (On Delivery)</b>\n"
+            f"🛵 អ្នកដឹក៖ <b>{driver_name}</b> (ស្វ័យប្រវត្តិ)\n"
+            f"👉 សូមថតរូប Barcode ឬវាយលេខបណ្ណ (ឧ. <code>INV-0001</code>) ដើម្បីដាក់ស្ថានភាព <b>កំពុងដឹក (On Delivery)</b>៖",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+        return
+
+    if text == "📸 ២. ដល់ទីតាំង Scan+ថតរូបទម្លាក់ទំនិញ":
+        driver_bot_sessions[user_id] = {"mode": "DROP"}
+        bot.reply_to(
+            message,
+            f"📸 <b>មុខងារដល់ទីតាំង៖ Scan + ថតរូបទម្លាក់ទំនិញ</b>\n"
+            f"🛵 អ្នកដឹក៖ <b>{driver_name}</b> (ស្វ័យប្រវត្តិ)\n"
+            f"👉 សូម <b>ថតរូបកញ្ចប់ទំនិញ/បណ្ណ</b> ផ្ញើចូលមកទីនេះ (តម្រូវឱ្យមានរូបថតភ្ជាប់ដាច់ខាត)៖",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+        return
+
+    if text == "📋 បញ្ជីកញ្ចប់កំពុងដឹករបស់ខ្ញុំ":
+        pending = [x for x in data.get("logs", []) if x.get("deliveryStatus") != "ទម្លាក់រួច"]
+        if not pending:
+            bot.reply_to(message, "✅ មិនមានកញ្ចប់ទំនិញនៅសល់ទេ!", reply_markup=build_bot_scan_reply_keyboard())
+            return
+        lines = [f"📋 <b>បញ្ជីកញ្ចប់កំពុងដឹក ({len(pending)} កញ្ចប់)៖</b>\n━━━━━━━━━━━━━━━━━━━━"]
+        for idx, p in enumerate(pending[-20:], 1):
+            drv = p.get("driverName") or "មិនទាន់មានអ្នកដឹក"
+            lines.append(f"{idx}. <code>{p.get('invNo')}</code> — <b>{p.get('name')}</b> ({p.get('phone')}) [🛵 {drv}]")
+        bot.reply_to(message, "\n".join(lines), reply_markup=build_bot_scan_reply_keyboard())
+        return
+
+    sess = driver_bot_sessions.get(user_id, {"mode": "PICKUP"})
+
+    if sess.get("mode") == "WAIT_CUSTOM_REMARK" and sess.get("invNo"):
+        item, data = find_package_by_text(sess["invNo"])
+        if item:
+            mode = sess.get("statusMode", "OK")
+            item["driverName"] = driver_name
+            item["deliveryStatus"] = "ទម្លាក់រួច" if mode == "OK" else "កញ្ចប់បញ្ហា"
+            item["isProblem"] = (mode != "OK")
+            item["remark"] = text
+            item["reason"] = text if item["isProblem"] else ""
+            save_db(data)
+            driver_bot_sessions[user_id] = {"mode": "DROP"}
+            ok, note = send_alert_to_shop_group(item, data, driver_name, item.get("deliveryProofFileId"))
+            bot.reply_to(
+                message,
+                build_status_alert_message(item, driver_name) + f"\n\n📸 <b>{note}</b>",
+                reply_markup=build_bot_scan_reply_keyboard()
+            )
+        return
+
+    item, data = find_package_by_text(text)
+    if not item:
+        bot.reply_to(message, f"❌ រកមិនឃើញបណ្ណ <code>{text}</code> ទេ!", reply_markup=build_bot_scan_reply_keyboard())
+        return
+
+    if sess.get("pendingPhotoId"):
+        photo_id = sess.pop("pendingPhotoId")
+        item["driverName"] = driver_name
+        item["deliveryProofFileId"] = photo_id
+        save_db(data)
+        bot.reply_to(
+            message,
+            f"✅ <b>បានភ្ជាប់រូបថតទៅនឹងបណ្ណ <code>{item.get('invNo')}</code> (អ្នកដឹក៖ {driver_name}) រួចរាល់!</b>\n"
+            f"👇 សូមជ្រើសរើសស្ថានភាព និង Remark ខាងក្រោម៖",
+            reply_markup=build_dropoff_status_keyboard(item.get("invNo"))
+        )
+        return
+
+    if sess.get("mode") == "PICKUP":
+        item["driverName"] = driver_name
+        item["deliveryStatus"] = "កំពុងដឹក"
+        item["isProblem"] = False
+        if not item.get("remark"):
+            item["remark"] = "កំពុងដឹកជញ្ជូន (On Delivery)"
+        save_db(data)
+        ok, note = send_alert_to_shop_group(item, data, driver_name)
+        bot.reply_to(
+            message,
+            f"🚚 <b>បានដាក់ស្ថានភាព «កំពុងដឹក (On Delivery)» ជោគជ័យ!</b>\n"
+            f"🔖 បណ្ណ៖ <code>{item.get('invNo')}</code> | 🛵 អ្នកដឹក៖ <b>{driver_name}</b> (ស្វ័យប្រវត្តិ)\n"
+            f"🚀 {note}",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+    else:
+        driver_bot_sessions[user_id] = {"mode": "DROP", "invNo": item.get("invNo")}
+        bot.reply_to(
+            message,
+            f"🔖 បានជ្រើសរើសបណ្ណ <code>{item.get('invNo')}</code> ({item.get('name')})\n"
+            f"🛵 អ្នកដឹក៖ <b>{driver_name}</b>\n"
+            f"📸 <b>ឥឡូវនេះ សូមថតរូបទំនិញ/បណ្ណផ្ញើចូលមកទីនេះ</b> ដើម្បីដាក់ Remark និងផ្ញើរូបថតភ្ជាប់ទៅ Group ហាង!",
+            reply_markup=build_bot_scan_reply_keyboard()
+        )
+
+# ==============================================================================
+# FLASK WEB SERVER & REST APIs
+# ==============================================================================
+app = Flask(__name__)
+CORS(app)
+
+@app.route("/")
+@app.route("/vip/cct8899")
+@app.route("/vip/cct8899/")
+@app.route("/driver")
+@app.route("/driver/")
+@app.route("/vip/cct8899/driver")
+@app.route("/vip/cct8899/driver/")
+def serve_vue_app():
+    index_file = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.isfile(index_file):
+        return send_from_directory(FRONTEND_DIST, "index.html")
+    return "Vue frontend មិនទាន់ Build ទេ។ សូមចូល frontend ហើយរត់ npm run build។", 503
+
+@app.route("/assets/<path:filename>")
+def serve_frontend_assets(filename):
+    return send_from_directory(os.path.join(FRONTEND_DIST, "assets"), filename)
+
+@app.route("/legacy/<path:filename>")
+def serve_legacy_scripts(filename):
+    return send_from_directory(os.path.join(FRONTEND_DIST, "legacy"), filename)
+
+@app.route("/logo.png")
+@app.route("/Logo.png")
+@app.route("/vip/cct8899/logo.png")
+@app.route("/vip/cct8899/Logo.png")
+def serve_logo():
+    candidates = [
+        os.path.join(BASE_DIR, "logo.png"),
+        os.path.join(FRONTEND_DIST, "logo.png"),
+        os.path.join(BASE_DIR, "Logo.png"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return send_from_directory(os.path.dirname(candidate), os.path.basename(candidate))
+    return "", 404
+
+@app.route('/api/users', methods=['GET', 'POST'])
+def handle_users():
+    db = load_db()
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        if 'users' in data and isinstance(data['users'], list) and len(data['users']) > 0:
+            db['users'] = data['users']
+            save_db(db)
+            return jsonify({"status": "success", "count": len(db['users']), "users": db['users']})
+        return jsonify({"status": "error", "message": "Invalid user data"}), 400
+    else:
+        return jsonify({"status": "success", "users": db.get('users', [])})
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", "")).strip().lower()
+    password = str(payload.get("password", "")).strip()
+    data = load_db()
+    for u in data.get("users", []):
+        if str(u.get("username", "")).lower() == username and str(u.get("password", "")) == password:
+            return jsonify({
+                "ok": True,
+                "user": {
+                    "id": u.get("id"),
+                    "username": u.get("username"),
+                    "displayName": u.get("displayName") or u.get("username"),
+                    "role": u.get("role", "staff")
+                }
+            })
+    return jsonify({"ok": False, "message": "ឈ្មោះគណនី ឬលេខសម្ងាត់មិនត្រឹមត្រូវទេ!"}), 401
+
+@app.route("/api/state", methods=["GET", "POST"])
+def api_state():
+    if request.method == "GET":
+        return jsonify(load_db())
+    payload = request.get_json(silent=True) or {}
+    data = load_db()
+    if "shops" in payload and isinstance(payload["shops"], list):
+        data["shops"] = payload["shops"]
+    if "users" in payload and isinstance(payload["users"], list) and len(payload["users"]) > 0:
+        data["users"] = payload["users"]
+    if "logs" in payload and isinstance(payload["logs"], list):
+        old_map = {x.get("invNo"): x for x in data.get("logs", []) if x.get("invNo")}
+        for new_item in payload["logs"]:
+            old_item = old_map.get(new_item.get("invNo"))
+            if old_item:
+                for k in ["telegramPhotoMsgId", "telegramChatId", "lastPhotoFileId", "deliveryProofFileId", "driverName"]:
+                    if not new_item.get(k) and old_item.get(k):
+                        new_item[k] = old_item[k]
+        data["logs"] = payload["logs"]
+    save_db(data)
+    return jsonify({
+        "ok": True,
+        "shops": data.get("shops", []),
+        "users": data.get("users", []),
+        "knownGroups": data.get("knownGroups", {}),
+        "recentPhotos": data.get("recentPhotos", [])
+    })
+
+@app.route("/api/send_alert", methods=["POST"])
+def api_send_alert():
+    payload = request.get_json(silent=True) or {}
+    inv_no = payload.get("invNo") or ""
+    driver_name = payload.get("driverName") or ""
+    proof_photo_b64 = payload.get("proofPhotoBase64")
+    log_override = payload.get("logItem")
+
+    data = load_db()
+    item = next((x for x in data.get("logs", []) if str(x.get("invNo", "")).lower() == inv_no.lower()), None) if inv_no else None
+    if log_override:
+        if item:
+            item.update({k: v for k, v in log_override.items() if v is not None and v != ""})
+        else:
+            item = log_override
+            data.setdefault("logs", []).append(item)
+    if not item:
+        return jsonify({"ok": False, "message": "រកមិនឃើញទិន្នន័យបណ្ណនេះទេ!"}), 404
+
+    if driver_name:
+        item["driverName"] = driver_name
+    save_db(data)
+
+    ok, msg = send_alert_to_shop_group(item, data, item.get("driverName", "Driver"), proof_photo_b64)
+    return jsonify({"ok": ok, "message": msg})
+
+def run_flask():
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
+
+if __name__ == "__main__":
+    init_db()
+
+    if BOT_TOKEN == "000000:PLACEHOLDER" or not BOT_TOKEN:
+        raise SystemExit("ERROR: CCT_BOT_TOKEN is not set. Telegram Bot cannot start.")
+
+    try:
+        bot.remove_webhook()
+        bot.set_my_commands([
+            BotCommand("scan", "🛵 បើកមុខងារស្កេនដឹកជញ្ជូន (On Delivery & ទម្លាក់ទំនិញ)"),
+            BotCommand("login", "🔑 ចងឈ្មោះគណនីអ្នកដឹកជញ្ជូនស្វ័យប្រវត្តិ"),
+            BotCommand("start", "🚀 បើកម៉ឺនុយគោលសម្រាប់ Driver")
+        ])
+    except Exception as exc:
+        print(f"Telegram setup warning: {exc}")
+
+    if os.environ.get("CCT_BOT_ONLY") == "1":
+        print("CCT Telegram Bot running in polling-only mode.")
+        bot.infinity_polling(skip_pending=False)
+    else:
+        threading.Thread(target=run_flask, daemon=True).start()
+        bot.infinity_polling(skip_pending=False)

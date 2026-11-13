@@ -1,0 +1,23 @@
+{
+  "admin_inline_scripts_extracted": 7,
+  "driver_inline_scripts_extracted": 1,
+  "admin_template_chars": 116372,
+  "driver_template_chars": 15132,
+  "login_modal_found": true,
+  "api_routes_preserved": true,
+  "token_removed_from_source": true,
+  "admin_script_files": [
+    "admin-01.js",
+    "admin-02.js",
+    "admin-03.js",
+    "admin-04.js",
+    "admin-05.js",
+    "admin-06.js",
+    "admin-07.js"
+  ],
+  "login_modal_removed_from_legacy_injection": true,
+  "database_backend": "PostgreSQL JSONB compatibility store",
+  "json_import_source": "database/source/cct_database(3).json",
+  "postgres_migration_script": "migrate_json_to_postgres.py",
+  "security_note": "Original hardcoded Telegram token removed; create a new token and set it in .env. API server-side authorization still required before Internet exposure."
+}

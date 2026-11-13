@@ -1,0 +1,14 @@
+{
+  "python_syntax": "passed (cct_telegram_bot-v2.py, cct_storage.py, migrate_json_to_postgres.py)",
+  "legacy_javascript_syntax": "passed after removing duplicate saveUsersToStorage declaration in admin-02.js",
+  "vue_production_build": "not run in this environment because npm install did not finish; user previously confirmed Vite build succeeded on Windows",
+  "postgres_import": "not run here because PostgreSQL server/client is not installed in this container",
+  "source_data_counts": {
+    "users": 4,
+    "shops": 95,
+    "knownGroups": 4,
+    "recentPhotos": 882,
+    "logs": 134
+  },
+  "security": "Hardcoded Telegram bot token removed from runtime and source copies; revoke the token exposed in the uploaded source and create a new token."
+}
